@@ -1,0 +1,97 @@
+name: RDP (Tailscale)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-job:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%_-'.ToCharArray()
+          $password = -join (1..20 | ForEach-Object { $alphabet | Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Write-Output "::add-mask::$password"
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $out = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          $process = Start-Process msiexec.exe -ArgumentList "/i `"$out`" /quiet /norestart" -Wait -PassThru
+          if ($process.ExitCode -notin 0, 3010) {
+            throw "Tailscale installer failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY repository secret is missing."
+          }
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "gh-rdp-${{ github.run_id }}-${{ github.run_attempt }}"
+          & $tailscale up --auth-key=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed with exit code $LASTEXITCODE" }
+          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw "Tailscale did not return an IPv4 address." }
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Save Connection Info
+        shell: powershell
+        run: |
+          @"
+          TYPE=RDP
+          TAILSCALE_IP=$env:TS_IP
+          HOSTNAME=$env:TS_HOSTNAME
+          PORT=3389
+          USERNAME=$env:RDP_USER
+          PASSWORD=$env:RDP_PASS
+          "@ | Set-Content -Path "connection-info.txt" -Encoding utf8
+          @"
+          ## RDP connection ready
+          - Tailscale IP: $env:TS_IP
+          - Username: $env:RDP_USER
+          - Password: $env:RDP_PASS
+          - Address: $env:TS_IP`:3389
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Upload Connection Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection-info-${{ github.run_id }}
+          path: connection-info.txt
+          retention-days: 1
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date -Format o)] RDP running at $env:TS_IP"
+            Start-Sleep -Seconds 300
+          }
